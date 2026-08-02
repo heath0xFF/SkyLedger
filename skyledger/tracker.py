@@ -41,6 +41,9 @@ class ActiveFlyover:
 
 
 class SkyLedgerTracker:
+    # Write raw_positions every N ticks to reduce DB contention
+    RAW_POSITIONS_WRITE_INTERVAL = 5
+
     def __init__(
         self,
         config: AppConfig,
@@ -61,6 +64,7 @@ class SkyLedgerTracker:
         self.last_poll_at: str | None = None
         self.last_discord_error: str | None = None
         self._stop_event = asyncio.Event()
+        self._raw_position_tick = 0
 
     async def run(self) -> None:
         while not self._stop_event.is_set():
@@ -84,11 +88,17 @@ class SkyLedgerTracker:
             fresh_snapshots,
             key=lambda item: item.distance_mi if item.distance_mi is not None else 9999,
         )
-        await asyncio.to_thread(
-            self.db.record_raw_positions,
-            fresh_snapshots,
-            self.config.raw_position_retention_days,
-        )
+
+        # Throttle raw_positions writes to reduce DB lock contention
+        self._raw_position_tick += 1
+        if self._raw_position_tick >= self.RAW_POSITIONS_WRITE_INTERVAL:
+            await asyncio.to_thread(
+                self.db.record_raw_positions,
+                fresh_snapshots,
+                self.config.raw_position_retention_days,
+            )
+            self._raw_position_tick = 0
+
         await self._process_snapshots(fresh_snapshots)
         self._cleanup_active()
         payload = self.build_payload()
@@ -249,6 +259,7 @@ class SkyLedgerTracker:
             closest["registration"] = closest.get("registration") or record.get("registration")
             closest["aircraft_type"] = record.get("aircraft_type")
             closest["operator"] = record.get("operator")
+            closest["total_sightings"] = record.get("total_sightings", 0)
         payload = {
             "mode": mode,
             "focus": focus,

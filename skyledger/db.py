@@ -111,6 +111,7 @@ class Database:
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds for lock contention
             yield conn
             conn.commit()
         finally:
@@ -122,7 +123,8 @@ class Database:
             try:
                 return fn()
             except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                err = str(exc).lower()
+                if not any(x in err for x in ("locked", "busy", "database is locked")) or attempt == attempts - 1:
                     raise
                 time.sleep(delay)
                 delay *= 2
@@ -444,3 +446,8 @@ class Database:
                 return counts
 
         return self.execute_with_retry(write)
+
+    def checkpoint_wal(self) -> None:
+        """Checkpoint the WAL file to prevent unbounded growth and reduce lock contention."""
+        with self.connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

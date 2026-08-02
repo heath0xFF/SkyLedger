@@ -29,6 +29,7 @@ const els = {
   statMaxDistance: document.querySelector("#statMaxDistance"),
   closestCallsign: document.querySelector("#closestCallsign"),
   closestIdentifier: document.querySelector("#closestIdentifier"),
+  closestSightings: document.querySelector("#closestSightings"),
   closestAltitude: document.querySelector("#closestAltitude"),
   closestSpeed: document.querySelector("#closestSpeed"),
   closestHeading: document.querySelector("#closestHeading"),
@@ -76,6 +77,15 @@ function fmtSpeed(value) {
 
 function fmtHeading(value) {
   return value === null || value === undefined ? "--" : `${Math.round(value)} deg`;
+}
+
+function fmtFrequentFlyer(count) {
+  if (count === undefined || count === null || Number.isNaN(Number(count))) return "--";
+  const num = Number(count);
+  if (num === 0) return "New plane! 🆕";
+  if (num === 1) return "First logged pass! 🔄";
+  if (num < 5) return `Frequent flyer (${num}x) ⚡`;
+  return `Local regular (${num}x) 👑`;
 }
 
 function label(ac) {
@@ -149,6 +159,7 @@ function renderLive(payload, stats, summary, closest) {
   els.statMaxDistance.textContent = fmtDistance(summary.max_distance_mi);
   els.closestCallsign.textContent = closest ? label(closest) : "No aircraft nearby";
   els.closestIdentifier.textContent = closest ? identifierLabel(closest) : "--";
+  els.closestSightings.textContent = closest ? fmtFrequentFlyer(closest.total_sightings) : "--";
   els.closestAltitude.textContent = closest ? fmtAltitude(closest.altitude_ft) : "--";
   els.closestSpeed.textContent = closest ? fmtSpeed(closest.speed_kt) : "--";
   els.closestHeading.textContent = closest ? fmtHeading(closest.heading) : "--";
