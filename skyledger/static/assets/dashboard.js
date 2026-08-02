@@ -30,6 +30,7 @@ const els = {
   closestCallsign: document.querySelector("#closestCallsign"),
   closestIdentifier: document.querySelector("#closestIdentifier"),
   closestSightings: document.querySelector("#closestSightings"),
+  closestRoute: document.querySelector("#closestRoute"),
   closestAltitude: document.querySelector("#closestAltitude"),
   closestSpeed: document.querySelector("#closestSpeed"),
   closestHeading: document.querySelector("#closestHeading"),
@@ -160,6 +161,9 @@ function renderLive(payload, stats, summary, closest) {
   els.closestCallsign.textContent = closest ? label(closest) : "No aircraft nearby";
   els.closestIdentifier.textContent = closest ? identifierLabel(closest) : "--";
   els.closestSightings.textContent = closest ? fmtFrequentFlyer(closest.total_sightings) : "--";
+  els.closestRoute.textContent = closest?.route_from && closest?.route_to
+    ? `${closest.route_from} → ${closest.route_to}`
+    : "Route unknown";
   els.closestAltitude.textContent = closest ? fmtAltitude(closest.altitude_ft) : "--";
   els.closestSpeed.textContent = closest ? fmtSpeed(closest.speed_kt) : "--";
   els.closestHeading.textContent = closest ? fmtHeading(closest.heading) : "--";

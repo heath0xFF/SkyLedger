@@ -153,7 +153,7 @@ Use `config.example.yaml` as the reference and keep real local values in `config
 - `raw_position_retention_days`: Retention for raw position samples.
 - `live_aircraft_timeout_seconds`: Hide aircraft whose latest message or position is older than this many seconds. Set to `0` to disable stale filtering.
 - `enable_discord_alerts`, `discord_webhook_url`: Optional Discord notifications.
-- `enable_enrichment`: Reserved for cache-first free/public enrichment.
+- `enable_enrichment`: Look up airline routes by callsign through ADSBDB and cache results locally.
 - `map_zoom_level`: Dashboard map zoom, also adjustable from `/settings`.
 - `map_tile_url`: Slippy-map tile URL template. Defaults to OpenStreetMap tiles and can point at a local tile server.
 

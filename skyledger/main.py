@@ -17,6 +17,7 @@ from .adsb import ADSBReader
 from .config import AppConfig, load_config, update_config_file
 from .db import Database
 from .discord import DiscordNotifier
+from .enrichment import EnrichmentProvider
 from .receiver_control import start_windows_receiver
 from .tracker import SkyLedgerTracker
 
@@ -112,7 +113,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
     db = Database(config.database_path)
     reader = ADSBReader(config.adsb_json_path, config.home_lat, config.home_lon)
     notifier = DiscordNotifier(config.discord_webhook_url, config.enable_discord_alerts)
-    tracker = SkyLedgerTracker(config, db, reader, notifier, manager.broadcast)
+    enricher = EnrichmentProvider(config.enable_enrichment, db)
+    tracker = SkyLedgerTracker(config, db, reader, notifier, manager.broadcast, enricher)
 
     app = FastAPI(title="SkyLedger", version="0.1.0")
     app.state.config = config

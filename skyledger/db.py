@@ -94,9 +94,17 @@ CREATE TABLE IF NOT EXISTS received_aircraft (
     max_distance_mi REAL,
     max_distance_seen_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS flight_route_cache (
+    callsign TEXT PRIMARY KEY,
+    route_from TEXT,
+    route_to TEXT,
+    source TEXT,
+    last_updated TEXT NOT NULL
+);
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class Database:
@@ -400,6 +408,36 @@ class Database:
                 (hex_value.lower(), limit),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def get_cached_flight_route(self, callsign: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM flight_route_cache WHERE callsign = ?",
+                (callsign.upper(),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def cache_flight_route(
+        self,
+        callsign: str,
+        route_from: str | None,
+        route_to: str | None,
+        source: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO flight_route_cache (
+                    callsign, route_from, route_to, source, last_updated
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(callsign) DO UPDATE SET
+                    route_from = excluded.route_from,
+                    route_to = excluded.route_to,
+                    source = excluded.source,
+                    last_updated = excluded.last_updated
+                """,
+                (callsign.upper(), route_from, route_to, source, utc_now_iso()),
+            )
 
     def get_recent_events(self, limit: int = 12) -> list[dict[str, Any]]:
         with self.connect() as conn:
