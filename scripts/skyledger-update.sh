@@ -50,7 +50,9 @@ SKYLEDGER_USER="$APP_USER" SKYLEDGER_GROUP="$APP_GROUP" ./install.sh
 
 if systemctl cat skyledger.service >/dev/null 2>&1; then
   log "Restarting skyledger.service"
-  systemctl try-restart skyledger.service
+  # The update unit is ordered before SkyLedger, so a blocking restart here
+  # deadlocks waiting for this oneshot unit to finish.
+  systemctl --no-block try-restart skyledger.service
 fi
 
 log "Update complete"
