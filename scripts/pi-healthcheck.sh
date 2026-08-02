@@ -75,12 +75,22 @@ except Exception:
 
 print("true" if status.get("receiver_online") else "false")
 print(status.get("source") or "")
+print("true" if status.get("tracker_running") else "false")
+print(int(status.get("tracker_consecutive_errors") or 0))
 PY
 )
 
 receiver_online="${status_fields[0]:-false}"
 source="${status_fields[1]:-$FALLBACK_ADSB_SOURCE}"
 source="${source:-$FALLBACK_ADSB_SOURCE}"
+tracker_running="${status_fields[2]:-false}"
+tracker_errors="${status_fields[3]:-0}"
+
+if [[ "$tracker_running" != "true" ]] || (( tracker_errors >= 5 )); then
+  log "SkyLedger tracker is unhealthy (running=${tracker_running}, consecutive_errors=${tracker_errors})"
+  restart_service "$SKYLEDGER_SERVICE"
+  exit 0
+fi
 
 if ! service_is_active "$READSB_SERVICE"; then
   log "$READSB_SERVICE is not active"

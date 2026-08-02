@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import ipaddress
+import os
 import re
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,6 +22,32 @@ from .tracker import SkyLedgerTracker
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = PACKAGE_DIR / "static"
+
+
+async def require_admin_access(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    """Allow local administration, or remote administration with a bearer token."""
+    host = request.client.host if request.client else ""
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return
+    except ValueError:
+        if host.lower() == "localhost":
+            return
+
+    expected = os.environ.get("SKYLEDGER_ADMIN_TOKEN", "")
+    scheme, _, supplied = (authorization or "").partition(" ")
+    if expected and scheme.lower() == "bearer" and hmac.compare_digest(supplied, expected):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Administrative actions are limited to localhost. Set SKYLEDGER_ADMIN_TOKEN "
+            "and send it as a Bearer token to administer remotely."
+        ),
+    )
 
 
 class MapZoomRequest(BaseModel):
@@ -37,6 +66,8 @@ class AircraftMarkerColorsRequest(BaseModel):
 
 
 class ConnectionManager:
+    SEND_TIMEOUT_SECONDS = 5.0
+
     def __init__(self) -> None:
         self.connections: set[WebSocket] = set()
 
@@ -48,14 +79,16 @@ class ConnectionManager:
         self.connections.discard(websocket)
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
-        stale: list[WebSocket] = []
-        for websocket in self.connections:
+        async def send(websocket: WebSocket) -> None:
             try:
-                await websocket.send_json(payload)
-            except RuntimeError:
-                stale.append(websocket)
-        for websocket in stale:
-            self.disconnect(websocket)
+                await asyncio.wait_for(
+                    websocket.send_json(payload),
+                    timeout=self.SEND_TIMEOUT_SECONDS,
+                )
+            except Exception:  # noqa: BLE001 - one broken client must not stop fan-out.
+                self.disconnect(websocket)
+
+        await asyncio.gather(*(send(websocket) for websocket in tuple(self.connections)))
 
 
 async def save_config(config_path: str | None, updates: dict[str, Any]) -> AppConfig:
@@ -130,7 +163,9 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 await websocket.send_json(tracker.last_payload)
             while True:
                 await websocket.receive_text()
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
             manager.disconnect(websocket)
 
     @app.get("/api/status")
@@ -139,64 +174,58 @@ def create_app(config_path: str | None = None) -> FastAPI:
 
     @app.get("/api/aircraft/live")
     async def api_live_aircraft() -> dict[str, Any]:
-        return tracker.build_payload()
+        return await tracker.build_payload_async()
 
     @app.get("/api/events/recent")
     async def api_recent_events(limit: int = 20) -> list[dict[str, Any]]:
-        return db.get_recent_events(limit=min(max(limit, 1), 100))
+        return await asyncio.to_thread(db.get_recent_events, min(max(limit, 1), 100))
 
     @app.get("/api/stats/today")
     async def api_today_stats() -> dict[str, Any]:
-        today = db.get_today_stats()
-        today["aircraft_count"] = db.count_distinct_aircraft_today(today["date"])
-        return today
+        data = await asyncio.to_thread(db.get_dashboard_data)
+        return data["today"]
 
     @app.get("/api/aircraft/{hex_value}")
     async def api_aircraft(hex_value: str) -> dict[str, Any]:
-        record = db.get_aircraft_record(hex_value)
+        record = await asyncio.to_thread(db.get_aircraft_record, hex_value)
         if not record:
             raise HTTPException(status_code=404, detail="Aircraft has not been logged yet.")
         return {
             "aircraft": record,
-            "events": db.get_aircraft_history(hex_value, limit=100),
+            "events": await asyncio.to_thread(db.get_aircraft_history, hex_value, 100),
         }
 
     @app.get("/api/history")
     async def api_history(limit: int = 200) -> list[dict[str, Any]]:
-        return db.get_history(limit=min(max(limit, 1), 500))
+        return await asyncio.to_thread(db.get_history, min(max(limit, 1), 500))
 
-    @app.post("/api/test-discord")
+    @app.post("/api/test-discord", dependencies=[Depends(require_admin_access)])
     async def api_test_discord() -> dict[str, Any]:
         ok, error = await notifier.send_test()
         return {"ok": ok, "error": error}
 
-    @app.post("/api/test-countdown")
+    @app.post("/api/test-countdown", dependencies=[Depends(require_admin_access)])
     async def api_test_countdown() -> dict[str, Any]:
         return await tracker.trigger_test_countdown()
 
-    @app.post("/api/receiver/start")
+    @app.post("/api/receiver/start", dependencies=[Depends(require_admin_access)])
     async def api_start_receiver() -> dict[str, Any]:
         return await asyncio.to_thread(start_windows_receiver, config.adsb_json_path, PACKAGE_DIR.parent)
 
-    @app.post("/api/history/clear")
+    @app.post("/api/history/clear", dependencies=[Depends(require_admin_access)])
     async def api_clear_history() -> dict[str, Any]:
-        tracker.active.clear()
-        tracker.alert_cooldowns.clear()
-        counts = await asyncio.to_thread(db.clear_history)
-        payload = tracker.build_payload()
-        tracker.last_payload = payload
-        await manager.broadcast(payload)
+        counts = await tracker.clear_history()
         return {"ok": True, "deleted": counts}
 
-    @app.post("/api/settings/map-zoom")
+    @app.post("/api/settings/map-zoom", dependencies=[Depends(require_admin_access)])
     async def api_update_map_zoom(request: MapZoomRequest) -> dict[str, Any]:
         updated = await save_config(config_path, {"map_zoom_level": request.map_zoom_level})
         config.map_zoom_level = updated.map_zoom_level
-        tracker.last_payload = tracker.build_payload()
+        tracker.last_payload = await tracker.build_payload_async()
         await manager.broadcast(tracker.last_payload)
         return {"ok": True, "map_zoom_level": config.map_zoom_level}
 
-    @app.post("/api/settings/home")
+    @app.post("/api/settings/home", dependencies=[Depends(require_admin_access)])
     async def api_update_home_settings(request: HomeSettingsRequest) -> dict[str, Any]:
         home_name = request.home_name.strip()
         if not home_name:
@@ -215,7 +244,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
         config.home_lon = updated.home_lon
         reader.home_lat = updated.home_lat
         reader.home_lon = updated.home_lon
-        tracker.last_payload = tracker.build_payload()
+        tracker.last_payload = await tracker.build_payload_async()
         await manager.broadcast(tracker.last_payload)
         return {
             "ok": True,
@@ -224,7 +253,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             "home_lon": config.home_lon,
         }
 
-    @app.post("/api/settings/aircraft-marker-colors")
+    @app.post("/api/settings/aircraft-marker-colors", dependencies=[Depends(require_admin_access)])
     async def api_update_aircraft_marker_colors(request: AircraftMarkerColorsRequest) -> dict[str, Any]:
         low_color = _normalize_hex_color(request.aircraft_marker_low_color, "low-altitude marker color")
         default_color = _normalize_hex_color(
@@ -240,7 +269,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
         )
         config.aircraft_marker_low_color = updated.aircraft_marker_low_color
         config.aircraft_marker_default_color = updated.aircraft_marker_default_color
-        tracker.last_payload = tracker.build_payload()
+        tracker.last_payload = await tracker.build_payload_async()
         await manager.broadcast(tracker.last_payload)
         return {
             "ok": True,

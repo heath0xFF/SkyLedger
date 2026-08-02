@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,6 +33,10 @@ class FakeReader:
 
 
 class CoreTests(unittest.TestCase):
+    @staticmethod
+    def current_utc_iso() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def test_haversine_distance(self) -> None:
         distance = haversine_miles(41.0, -87.0, 41.01, -87.0)
         self.assertGreater(distance, 0.65)
@@ -227,7 +232,7 @@ class CoreTests(unittest.TestCase):
                 },
                 41.0,
                 -87.0,
-                "2026-06-01T12:00:00Z",
+                self.current_utc_iso(),
             )
             assert snapshot is not None
             db.record_raw_positions([snapshot], retention_days=14)
@@ -526,7 +531,7 @@ class CoreTests(unittest.TestCase):
                 {"hex": "ABC123", "lat": 41.001, "lon": -87.0, "alt_baro": 2200},
                 41.0,
                 -87.0,
-                "2026-06-01T12:00:00Z",
+                self.current_utc_iso(),
             )
             assert snapshot is not None
             db.record_raw_positions([snapshot], retention_days=14)
@@ -540,6 +545,43 @@ class CoreTests(unittest.TestCase):
                 # WAL file exists but should be small after TRUNCATE checkpoint
                 self.assertLess(wal_path.stat().st_size, 1000)
 
+    def test_raw_position_retention_boundary(self) -> None:
+        """Positions at the cutoff survive while older positions are deleted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(str(Path(tmp) / "skyledger.db"))
+            db.init()
+            now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+            cutoff = now - timedelta(days=14)
+
+            at_cutoff = normalize_aircraft(
+                {"hex": "ABC123", "lat": 41.001, "lon": -87.0},
+                41.0,
+                -87.0,
+                cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+            before_cutoff = normalize_aircraft(
+                {"hex": "DEF456", "lat": 41.002, "lon": -87.0},
+                41.0,
+                -87.0,
+                (cutoff - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+            assert at_cutoff is not None
+            assert before_cutoff is not None
+
+            class FrozenDateTime(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return now if tz is not None else now.replace(tzinfo=None)
+
+            with patch("skyledger.db.datetime", FrozenDateTime):
+                db.record_raw_positions([at_cutoff, before_cutoff], retention_days=14)
+
+            with db.connect() as conn:
+                retained = conn.execute(
+                    "SELECT hex FROM raw_positions ORDER BY hex"
+                ).fetchall()
+            self.assertEqual([row["hex"] for row in retained], ["abc123"])
+
     def test_tracker_throttles_raw_positions_writes(self) -> None:
         """Test that tracker only writes raw_positions every RAW_POSITIONS_WRITE_INTERVAL ticks."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -550,7 +592,7 @@ class CoreTests(unittest.TestCase):
                 {"hex": "ABC123", "lat": 41.001, "lon": -87.0, "alt_baro": 2200, "seen": 1, "seen_pos": 1},
                 41.0,
                 -87.0,
-                "2026-06-01T12:00:00Z",
+                self.current_utc_iso(),
             )
             assert snapshot is not None
 

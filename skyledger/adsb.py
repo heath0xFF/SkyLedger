@@ -153,7 +153,11 @@ def normalize_aircraft(
 
     return AircraftSnapshot(
         key=key.lower(),
-        hex=hex_value.lower() if hex_value else key.lower(),
+        # Callsigns are useful as transient live-map keys, but are not stable
+        # aircraft identities: they can change between flights and be reused by
+        # different airframes.  Keep the persistent ICAO identity empty when a
+        # receiver row does not provide one.
+        hex=hex_value.lower() if hex_value else "",
         callsign=callsign,
         registration=registration,
         lat=lat,

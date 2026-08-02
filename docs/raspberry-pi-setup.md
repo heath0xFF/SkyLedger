@@ -120,7 +120,7 @@ Clone the GitHub repo into the Pi user's home directory. This clone is the sourc
 cd ~
 git clone https://github.com/cjs007/SkyLedger.git
 cd ~/SkyLedger
-git checkout master
+git checkout main
 chmod +x install.sh scripts/pi-healthcheck.sh scripts/skyledger-update.sh
 ```
 
@@ -236,15 +236,15 @@ The update service uses:
 
 - Source checkout: `/home/pi/SkyLedger`
 - Remote: `origin`
-- Branch: `master`
+- Branch: `main`
 - Runtime copy: `/opt/skyledger`
 - Config: `/etc/skyledger/config.yaml`
 
 At boot, `skyledger-update.service` runs before `skyledger.service`. The timer also checks every 15 minutes. It does:
 
 1. `git fetch --prune origin`
-2. `git checkout master` if needed
-3. `git merge --ff-only origin/master`
+2. `git checkout main` if needed
+3. `git merge --ff-only origin/main`
 4. `./install.sh`
 5. `systemctl try-restart skyledger.service`
 
@@ -263,7 +263,7 @@ Normal development flow:
 # on your main computer
 git add .
 git commit -m "Update SkyLedger dashboard"
-git push origin master
+git push origin main
 
 # on the Pi, either wait for the timer or run:
 sudo systemctl start skyledger-update.service

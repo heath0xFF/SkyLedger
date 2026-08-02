@@ -8,7 +8,7 @@ ConditionPathIsDirectory=/home/pi/SkyLedger/.git
 [Service]
 Type=oneshot
 Environment=SKYLEDGER_REPO_DIR=/home/pi/SkyLedger
-Environment=SKYLEDGER_BRANCH=master
+Environment=SKYLEDGER_BRANCH=main
 Environment=SKYLEDGER_USER=pi
 ExecStart=/bin/bash /home/pi/SkyLedger/scripts/skyledger-update.sh
 

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import os
+import tempfile
+import threading
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+_CONFIG_WRITE_LOCK = threading.Lock()
 
 
 DEFAULT_CONFIG_PATHS = (
@@ -94,21 +99,60 @@ def update_config_file(path: str | None, updates: dict[str, Any]) -> AppConfig:
         names = ", ".join(sorted(unknown))
         raise ValueError(f"Unknown config field(s): {names}")
 
-    raw: dict[str, Any] = {}
-    if config_path.exists():
-        with config_path.open("r", encoding="utf-8") as handle:
-            loaded = yaml.safe_load(handle) or {}
-            if not isinstance(loaded, dict):
-                raise ValueError(f"Config file must contain a YAML mapping: {config_path}")
-            raw = loaded
+    with _CONFIG_WRITE_LOCK:
+        raw: dict[str, Any] = {}
+        existing_mode: int | None = None
+        if config_path.exists():
+            existing_mode = config_path.stat().st_mode & 0o777
+            with config_path.open("r", encoding="utf-8") as handle:
+                loaded = yaml.safe_load(handle) or {}
+                if not isinstance(loaded, dict):
+                    raise ValueError(f"Config file must contain a YAML mapping: {config_path}")
+                raw = loaded
 
-    for key, value in updates.items():
-        raw[key] = _coerce(value, allowed[key].type)
+        for key, value in updates.items():
+            raw[key] = _coerce(value, allowed[key].type)
 
-    with config_path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(raw, handle, sort_keys=False)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=config_path.parent,
+                prefix=f".{config_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                yaml.safe_dump(raw, handle, sort_keys=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if existing_mode is not None:
+                temp_path.chmod(existing_mode)
+            os.replace(temp_path, config_path)
+            temp_path = None
+            _fsync_directory(config_path.parent)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     return load_config(str(config_path))
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist an atomic rename where the platform supports directory fsync."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
 
 
 def _coerce(value: Any, annotation: Any) -> Any:

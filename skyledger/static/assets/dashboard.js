@@ -277,7 +277,7 @@ function renderMap(payload) {
   const startY = Math.floor(top / 256);
   const endY = Math.floor((top + height) / 256);
   const tileCount = 2 ** zoom;
-  const fragments = [];
+  const tiles = document.createDocumentFragment();
 
   for (let tileY = startY; tileY <= endY; tileY += 1) {
     if (tileY < 0 || tileY >= tileCount) continue;
@@ -289,11 +289,19 @@ function renderMap(payload) {
         .replaceAll("{z}", String(zoom))
         .replaceAll("{x}", String(wrappedX))
         .replaceAll("{y}", String(tileY));
-      fragments.push(`<img src="${escapeHtml(url)}" alt="" style="left:${x}px;top:${y}px" loading="lazy" referrerpolicy="no-referrer" onerror="this.classList.add('tile-error')">`);
+      const tile = document.createElement("img");
+      tile.src = url;
+      tile.alt = "";
+      tile.style.left = `${x}px`;
+      tile.style.top = `${y}px`;
+      tile.loading = "lazy";
+      tile.referrerPolicy = "no-referrer";
+      tile.addEventListener("error", () => tile.classList.add("tile-error"));
+      tiles.append(tile);
     }
   }
 
-  els.mapTiles.innerHTML = fragments.join("");
+  els.mapTiles.replaceChildren(tiles);
 }
 
 function drawMapOverlay(ctx, scale, cssWidth, cssHeight) {
@@ -437,15 +445,6 @@ function latLonToWorld(lat, lon, zoom) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }
 
 function connect() {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -12,6 +13,7 @@ from .discord import DiscordNotifier
 from .geo import cardinal_direction
 
 Broadcaster = Callable[[dict[str, Any]], Awaitable[None]]
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -43,6 +45,7 @@ class ActiveFlyover:
 class SkyLedgerTracker:
     # Write raw_positions every N ticks to reduce DB contention
     RAW_POSITIONS_WRITE_INTERVAL = 5
+    MAX_ERROR_BACKOFF_SECONDS = 30.0
 
     def __init__(
         self,
@@ -63,24 +66,50 @@ class SkyLedgerTracker:
         self.last_payload: dict[str, Any] = {}
         self.last_poll_at: str | None = None
         self.last_discord_error: str | None = None
+        self.tracker_running = False
+        self.tracker_last_success_at: str | None = None
+        self.tracker_last_error: str | None = None
+        self.tracker_consecutive_errors = 0
         self._stop_event = asyncio.Event()
+        self._mutation_lock = asyncio.Lock()
         self._raw_position_tick = 0
 
     async def run(self) -> None:
-        while not self._stop_event.is_set():
-            await self.tick()
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(),
-                    timeout=max(0.5, self.config.poll_interval_seconds),
-                )
-            except asyncio.TimeoutError:
-                pass
+        self.tracker_running = True
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    await self.tick()
+                except Exception as exc:  # noqa: BLE001 - keep the tracker supervised.
+                    self.tracker_consecutive_errors += 1
+                    self.tracker_last_error = f"{type(exc).__name__}: {exc}"
+                    LOGGER.exception("SkyLedger tracker tick failed")
+                    delay = min(
+                        self.MAX_ERROR_BACKOFF_SECONDS,
+                        max(0.5, self.config.poll_interval_seconds)
+                        * (2 ** min(self.tracker_consecutive_errors - 1, 10)),
+                    )
+                else:
+                    self.tracker_last_success_at = utc_now_iso()
+                    self.tracker_last_error = None
+                    self.tracker_consecutive_errors = 0
+                    delay = max(0.5, self.config.poll_interval_seconds)
+
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self.tracker_running = False
 
     def stop(self) -> None:
         self._stop_event.set()
 
     async def tick(self) -> dict[str, Any]:
+        async with self._mutation_lock:
+            return await self._tick_unlocked()
+
+    async def _tick_unlocked(self) -> dict[str, Any]:
         snapshots = await self.reader.read()
         fresh_snapshots = [snapshot for snapshot in snapshots if self._is_snapshot_fresh(snapshot)]
         self.last_poll_at = utc_now_iso()
@@ -101,11 +130,23 @@ class SkyLedgerTracker:
 
         await self._process_snapshots(fresh_snapshots)
         self._cleanup_active()
-        payload = self.build_payload()
+        payload = await self.build_payload_async()
         self.last_payload = payload
         if self.broadcaster:
             await self.broadcaster(payload)
         return payload
+
+    async def clear_history(self) -> dict[str, int]:
+        """Clear persistent and in-memory history without racing an ingestion tick."""
+        async with self._mutation_lock:
+            counts = await asyncio.to_thread(self.db.clear_history)
+            self.active.clear()
+            self.alert_cooldowns.clear()
+            payload = await self.build_payload_async()
+            self.last_payload = payload
+            if self.broadcaster:
+                await self.broadcaster(payload)
+            return counts
 
     async def _process_snapshots(self, snapshots: list[AircraftSnapshot]) -> None:
         now = time.monotonic()
@@ -225,7 +266,7 @@ class SkyLedgerTracker:
         if now - self.alert_cooldowns.get(cooldown_key, 0) < cooldown_seconds:
             return
 
-        record = self.db.get_aircraft_record(snapshot.hex) or {}
+        record = await asyncio.to_thread(self.db.get_aircraft_record, snapshot.hex) or {}
         ok, error = await self.notifier.send_alert(
             {
                 **record,
@@ -251,11 +292,12 @@ class SkyLedgerTracker:
 
     def build_payload(self) -> dict[str, Any]:
         mode, focus = self._current_mode()
-        today = self.db.get_today_stats()
-        summary = self.db.get_summary_stats()
         closest = self.live_aircraft[0].to_dict() if self.live_aircraft else None
+        dashboard_data = self.db.get_dashboard_data(closest.get("hex") if closest else None)
+        today = dashboard_data["today"]
+        summary = dashboard_data["summary"]
         if closest:
-            record = self.db.get_aircraft_record(closest["hex"]) or {}
+            record = dashboard_data["closest_record"] or {}
             closest["registration"] = closest.get("registration") or record.get("registration")
             closest["aircraft_type"] = record.get("aircraft_type")
             closest["operator"] = record.get("operator")
@@ -285,11 +327,14 @@ class SkyLedgerTracker:
             "stats_total": summary,
             "stats_today": {
                 **today,
-                "aircraft_count": self.db.count_distinct_aircraft_today(today["date"]),
                 "helicopters": sum(1 for item in self.live_aircraft if item.is_helicopter),
             },
         }
         return payload
+
+    async def build_payload_async(self) -> dict[str, Any]:
+        """Build a payload without blocking the asyncio event loop on SQLite."""
+        return await asyncio.to_thread(self.build_payload)
 
     def status_payload(self) -> dict[str, Any]:
         status = self.reader.status.to_dict()
@@ -297,7 +342,11 @@ class SkyLedgerTracker:
             {
                 "last_poll_at": self.last_poll_at,
                 "last_discord_error": self.last_discord_error,
-                "database_path": str(self.db.path),
+                "tracker_running": self.tracker_running,
+                "tracker_last_success_at": self.tracker_last_success_at,
+                "tracker_last_error": self.tracker_last_error,
+                "tracker_consecutive_errors": self.tracker_consecutive_errors,
+                "database_path": self.db.path.name,
                 "config": self.config.public_dict(),
             }
         )
@@ -395,7 +444,7 @@ class SkyLedgerTracker:
             demo=True,
         )
         self.active[snapshot.key] = active
-        payload = self.build_payload()
+        payload = await self.build_payload_async()
         if self.broadcaster:
             await self.broadcaster(payload)
         return payload

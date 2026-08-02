@@ -8,6 +8,40 @@ function when(value) {
   return value ? new Date(value).toLocaleString() : "--";
 }
 
+function cell(row, value) {
+  const td = document.createElement("td");
+  td.textContent = value;
+  row.append(td);
+  return td;
+}
+
+function messageRow(rows, message) {
+  rows.replaceChildren();
+  const row = document.createElement("tr");
+  const td = cell(row, message);
+  td.colSpan = 6;
+  rows.append(row);
+}
+
+function renderEvents(rows, events) {
+  rows.replaceChildren();
+  if (!events.length) {
+    messageRow(rows, "No events logged for this aircraft.");
+    return;
+  }
+
+  for (const event of events) {
+    const row = document.createElement("tr");
+    cell(row, when(event.seen_at));
+    cell(row, event.callsign || "--");
+    cell(row, fmt(event.altitude_ft, " ft"));
+    cell(row, event.distance_mi === null || event.distance_mi === undefined ? "--" : `${Number(event.distance_mi).toFixed(2)} mi`);
+    cell(row, fmt(event.speed_kt, " kt"));
+    cell(row, event.event_type || "--");
+    rows.append(row);
+  }
+}
+
 async function loadAircraft() {
   const hex = decodeURIComponent(window.location.pathname.split("/").pop() || "");
   document.querySelector("#aircraftHex").textContent = hex || "--";
@@ -29,19 +63,10 @@ async function loadAircraft() {
     document.querySelector("#aircraftClosest").textContent = aircraft.lowest_distance_mi === null || aircraft.lowest_distance_mi === undefined
       ? "--"
       : `${Number(aircraft.lowest_distance_mi).toFixed(2)} mi`;
-    rows.innerHTML = (payload.events || []).map((event) => `
-      <tr>
-        <td>${when(event.seen_at)}</td>
-        <td>${event.callsign || "--"}</td>
-        <td>${fmt(event.altitude_ft, " ft")}</td>
-        <td>${event.distance_mi === null || event.distance_mi === undefined ? "--" : `${Number(event.distance_mi).toFixed(2)} mi`}</td>
-        <td>${fmt(event.speed_kt, " kt")}</td>
-        <td>${event.event_type || "--"}</td>
-      </tr>
-    `).join("") || `<tr><td colspan="6">No events logged for this aircraft.</td></tr>`;
+    renderEvents(rows, payload.events || []);
   } catch (error) {
     document.querySelector("#aircraftMeta").textContent = "Aircraft has not been logged yet.";
-    rows.innerHTML = `<tr><td colspan="6">No events logged for this aircraft.</td></tr>`;
+    messageRow(rows, "No events logged for this aircraft.");
   }
 }
 

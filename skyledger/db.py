@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -94,16 +96,31 @@ CREATE TABLE IF NOT EXISTS received_aircraft (
 );
 """
 
+SCHEMA_VERSION = 1
+
 
 class Database:
+    SUMMARY_CACHE_TTL_SECONDS = 10.0
+
     def __init__(self, path: str) -> None:
         self.path = Path(path).expanduser()
         if self.path.parent != Path("."):
             self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._summary_cache: dict[str, Any] | None = None
+        self._summary_cache_at = 0.0
+        self._summary_cache_lock = threading.Lock()
 
     def init(self) -> None:
         with self.connect() as conn:
+            current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if current_version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Database schema version {current_version} is newer than supported "
+                    f"version {SCHEMA_VERSION}."
+                )
             conn.executescript(SCHEMA)
+            if current_version < SCHEMA_VERSION:
+                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -143,7 +160,7 @@ class Database:
                 item.heading,
             )
             for item in snapshot_list
-            if item.has_position
+            if item.hex and item.has_position
         ]
         received_rows = [
             (
@@ -151,7 +168,7 @@ class Database:
                 item.received_at,
                 item.received_at,
                 item.callsign,
-                1,
+                int(item.has_position),
                 item.distance_mi,
                 item.received_at if item.distance_mi is not None else None,
             )
@@ -171,10 +188,9 @@ class Database:
                         """,
                         rows,
                     )
-                conn.execute(
-                    "DELETE FROM raw_positions WHERE seen_at < datetime('now', ?)",
-                    (f"-{int(retention_days)} days",),
-                )
+                cutoff = datetime.now(timezone.utc) - timedelta(days=int(retention_days))
+                cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+                conn.execute("DELETE FROM raw_positions WHERE seen_at < ?", (cutoff_iso,))
                 if received_rows:
                     conn.executemany(
                         """
@@ -186,7 +202,7 @@ class Database:
                         ON CONFLICT(hex) DO UPDATE SET
                             last_seen = excluded.last_seen,
                             last_callsign = COALESCE(excluded.last_callsign, received_aircraft.last_callsign),
-                            total_positions = received_aircraft.total_positions + 1,
+                            total_positions = received_aircraft.total_positions + excluded.total_positions,
                             max_distance_mi = CASE
                                 WHEN excluded.max_distance_mi IS NULL THEN received_aircraft.max_distance_mi
                                 WHEN received_aircraft.max_distance_mi IS NULL THEN excluded.max_distance_mi
@@ -215,8 +231,19 @@ class Database:
         seen_at = snapshot.received_at or utc_now_iso()
         date = seen_at[:10]
 
+        if not snapshot.hex:
+            return {
+                "is_new_aircraft": False,
+                "is_new_lowest": False,
+                "previous_sightings": 0,
+                "previous_lowest_altitude_ft": None,
+            }
+
         def write() -> dict[str, Any]:
             with self.connect() as conn:
+                # Serialize the read/modify/write sequence so two first
+                # sightings cannot both conclude that the aircraft is new.
+                conn.execute("BEGIN IMMEDIATE")
                 aircraft = conn.execute(
                     "SELECT * FROM aircraft WHERE hex = ?",
                     (snapshot.hex,),
@@ -233,13 +260,14 @@ class Database:
                     conn.execute(
                         """
                         INSERT INTO aircraft (
-                            hex, first_seen, last_seen, total_sightings,
+                            hex, registration, first_seen, last_seen, total_sightings,
                             lowest_altitude_ft, lowest_distance_mi
                         )
-                        VALUES (?, ?, ?, 1, ?, ?)
+                        VALUES (?, ?, ?, ?, 1, ?, ?)
                         """,
                         (
                             snapshot.hex,
+                            snapshot.registration,
                             seen_at,
                             seen_at,
                             snapshot.altitude_ft,
@@ -251,6 +279,7 @@ class Database:
                         """
                         UPDATE aircraft
                         SET last_seen = ?,
+                            registration = COALESCE(?, registration),
                             total_sightings = total_sightings + 1,
                             lowest_altitude_ft = CASE
                                 WHEN ? IS NULL THEN lowest_altitude_ft
@@ -268,6 +297,7 @@ class Database:
                         """,
                         (
                             seen_at,
+                            snapshot.registration,
                             snapshot.altitude_ft,
                             snapshot.altitude_ft,
                             snapshot.altitude_ft,
@@ -403,27 +433,103 @@ class Database:
                 }
             return dict(row)
 
+    @staticmethod
+    def _day_bounds(date: str) -> tuple[str, str]:
+        start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        return (
+            start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+
     def count_distinct_aircraft_today(self, date: str | None = None) -> int:
         date = date or utc_now_iso()[:10]
+        start, end = self._day_bounds(date)
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(DISTINCT hex) AS count FROM flyover_events WHERE substr(seen_at, 1, 10) = ?",
-                (date,),
+                "SELECT COUNT(DISTINCT hex) AS count FROM flyover_events "
+                "WHERE seen_at >= ? AND seen_at < ?",
+                (start, end),
             ).fetchone()
             return int(row["count"])
 
     def get_summary_stats(self) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._summary_cache_lock:
+            if (
+                self._summary_cache is not None
+                and now - self._summary_cache_at < self.SUMMARY_CACHE_TTL_SECONDS
+            ):
+                return dict(self._summary_cache)
         with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT
-                    (SELECT COUNT(*) FROM received_aircraft) AS total_aircraft,
-                    (SELECT COUNT(*) FROM flyover_events) AS total_flyovers,
-                    (SELECT MIN(altitude_ft) FROM flyover_events WHERE altitude_ft IS NOT NULL) AS lowest_flyover_ft,
-                    (SELECT MAX(max_distance_mi) FROM received_aircraft) AS max_distance_mi
-                """
+            summary = self._get_summary_stats(conn)
+        with self._summary_cache_lock:
+            self._summary_cache = dict(summary)
+            self._summary_cache_at = now
+        return summary
+
+    @staticmethod
+    def _get_summary_stats(conn: sqlite3.Connection) -> dict[str, Any]:
+        row = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM received_aircraft) AS total_aircraft,
+                (SELECT COUNT(*) FROM flyover_events) AS total_flyovers,
+                (SELECT MIN(altitude_ft) FROM flyover_events WHERE altitude_ft IS NOT NULL) AS lowest_flyover_ft,
+                (SELECT MAX(max_distance_mi) FROM received_aircraft) AS max_distance_mi
+            """
+        ).fetchone()
+        return dict(row)
+
+    def get_dashboard_data(self, closest_hex: str | None = None) -> dict[str, Any]:
+        """Fetch all persistent dashboard data with one SQLite connection."""
+        date = utc_now_iso()[:10]
+        start, end = self._day_bounds(date)
+        now = time.monotonic()
+        with self.connect() as conn:
+            today_row = conn.execute(
+                "SELECT * FROM daily_stats WHERE date = ?", (date,)
             ).fetchone()
-            return dict(row)
+            today = dict(today_row) if today_row else {
+                "date": date,
+                "total_flyovers": 0,
+                "new_aircraft": 0,
+                "repeat_aircraft": 0,
+                "low_flyovers": 0,
+                "lowest_altitude_ft": None,
+            }
+            distinct = conn.execute(
+                "SELECT COUNT(DISTINCT hex) AS count FROM flyover_events "
+                "WHERE seen_at >= ? AND seen_at < ?",
+                (start, end),
+            ).fetchone()
+            with self._summary_cache_lock:
+                cached = (
+                    dict(self._summary_cache)
+                    if self._summary_cache is not None
+                    and now - self._summary_cache_at < self.SUMMARY_CACHE_TTL_SECONDS
+                    else None
+                )
+            summary = cached or self._get_summary_stats(conn)
+            if cached is None:
+                with self._summary_cache_lock:
+                    self._summary_cache = dict(summary)
+                    self._summary_cache_at = now
+            record = None
+            if closest_hex:
+                row = conn.execute(
+                    """
+                    SELECT a.*, e.route_from, e.route_to,
+                           e.source AS enrichment_source, e.last_updated AS enrichment_updated
+                    FROM aircraft a
+                    LEFT JOIN aircraft_enrichment_cache e ON e.hex = a.hex
+                    WHERE a.hex = ?
+                    """,
+                    (closest_hex.lower(),),
+                ).fetchone()
+                record = dict(row) if row else None
+        today["aircraft_count"] = int(distinct["count"])
+        return {"today": today, "summary": summary, "closest_record": record}
 
     def clear_history(self) -> dict[str, int]:
         def write() -> dict[str, int]:
@@ -445,9 +551,41 @@ class Database:
                 )
                 return counts
 
-        return self.execute_with_retry(write)
+        result = self.execute_with_retry(write)
+        with self._summary_cache_lock:
+            self._summary_cache = None
+            self._summary_cache_at = 0.0
+        return result
 
     def checkpoint_wal(self) -> None:
         """Checkpoint the WAL file to prevent unbounded growth and reduce lock contention."""
         with self.connect() as conn:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def quick_check(self) -> str:
+        """Return SQLite's quick integrity-check result."""
+        with self.connect() as conn:
+            rows = conn.execute("PRAGMA quick_check").fetchall()
+        return "\n".join(str(row[0]) for row in rows)
+
+    def backup(self, destination: str | Path) -> Path:
+        """Create a transactionally consistent online backup, including WAL data."""
+        destination_path = Path(destination).expanduser().resolve()
+        source_path = self.path.resolve()
+        if destination_path == source_path:
+            raise ValueError("Backup destination must differ from the live database path.")
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = destination_path.with_name(f".{destination_path.name}.tmp")
+        temporary_path.unlink(missing_ok=True)
+        try:
+            with sqlite3.connect(source_path, timeout=15) as source:
+                source.execute("PRAGMA busy_timeout=30000")
+                with sqlite3.connect(temporary_path) as target:
+                    source.backup(target)
+                    result = target.execute("PRAGMA quick_check").fetchone()[0]
+                    if result != "ok":
+                        raise sqlite3.DatabaseError(f"Backup integrity check failed: {result}")
+            temporary_path.replace(destination_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return destination_path

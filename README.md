@@ -208,6 +208,30 @@ API:
 - `POST /api/test-countdown`
 - `WS /ws/live`
 
+Administrative `POST` endpoints are available without credentials only from
+localhost. For remote administration, set `SKYLEDGER_ADMIN_TOKEN` in the service
+environment and send `Authorization: Bearer <token>`. Read-only dashboard and
+history routes remain available on the configured bind address.
+
+## Database Maintenance
+
+Create a transactionally consistent backup while SkyLedger is running:
+
+```bash
+python -m skyledger.maintenance --config /etc/skyledger/config.yaml backup /path/to/backups/skyledger.db
+```
+
+The command uses SQLite's online backup API, includes committed WAL data, and
+checks the backup before replacing the destination. Check the live database with:
+
+```bash
+python -m skyledger.maintenance --config /etc/skyledger/config.yaml check
+```
+
+To restore, stop SkyLedger, preserve the damaged database and its `-wal`/`-shm`
+files, copy a verified backup to `database_path`, run the `check` command, and
+then restart SkyLedger. Keep backups on storage separate from the receiver.
+
 ## License
 
 SkyLedger is available under the custom SkyLedger Non-Commercial License. It is free to use, modify, and share for non-commercial purposes. Commercial use requires a separate written commercial license from the copyright holder.

@@ -17,24 +17,56 @@ function flags(row) {
   return list.join(", ") || "--";
 }
 
+function cell(row, value) {
+  const td = document.createElement("td");
+  td.textContent = value;
+  row.append(td);
+  return td;
+}
+
+function messageRow(rows, message) {
+  rows.replaceChildren();
+  const row = document.createElement("tr");
+  const td = cell(row, message);
+  td.colSpan = 7;
+  rows.append(row);
+}
+
+function renderEvents(rows, events) {
+  rows.replaceChildren();
+  if (!events.length) {
+    messageRow(rows, "No flyovers logged yet.");
+    return;
+  }
+
+  for (const event of events) {
+    const row = document.createElement("tr");
+    cell(row, when(event.seen_at));
+
+    const identity = document.createElement("td");
+    const link = document.createElement("a");
+    link.href = `/aircraft/${encodeURIComponent(event.hex || "")}`;
+    link.textContent = event.callsign || event.hex || "--";
+    identity.append(link);
+    row.append(identity);
+
+    cell(row, fmt(event.altitude_ft, " ft"));
+    cell(row, event.distance_mi === null || event.distance_mi === undefined ? "--" : `${Number(event.distance_mi).toFixed(2)} mi`);
+    cell(row, fmt(event.speed_kt, " kt"));
+    cell(row, [event.registration, event.aircraft_type, event.operator].filter(Boolean).join(" | ") || event.hex || "--");
+    cell(row, flags(event));
+    rows.append(row);
+  }
+}
+
 async function loadHistory() {
   const rows = document.querySelector("#historyRows");
   try {
     const response = await fetch("/api/history?limit=300");
     const events = await response.json();
-    rows.innerHTML = events.map((event) => `
-      <tr>
-        <td>${when(event.seen_at)}</td>
-        <td><a href="/aircraft/${encodeURIComponent(event.hex)}">${event.callsign || event.hex || "--"}</a></td>
-        <td>${fmt(event.altitude_ft, " ft")}</td>
-        <td>${event.distance_mi === null || event.distance_mi === undefined ? "--" : `${Number(event.distance_mi).toFixed(2)} mi`}</td>
-        <td>${fmt(event.speed_kt, " kt")}</td>
-        <td>${[event.registration, event.aircraft_type, event.operator].filter(Boolean).join(" | ") || event.hex || "--"}</td>
-        <td>${flags(event)}</td>
-      </tr>
-    `).join("") || `<tr><td colspan="7">No flyovers logged yet.</td></tr>`;
+    renderEvents(rows, events);
   } catch (error) {
-    rows.innerHTML = `<tr><td colspan="7">Unable to load history.</td></tr>`;
+    messageRow(rows, "Unable to load history.");
   }
 }
 
