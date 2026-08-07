@@ -44,8 +44,8 @@ class ActiveFlyover:
 
 
 class SkyLedgerTracker:
-    # Write raw_positions every N ticks to reduce DB contention
     RAW_POSITIONS_WRITE_INTERVAL = 5
+    WAL_CHECKPOINT_INTERVAL_SECONDS = 60
     MAX_ERROR_BACKOFF_SECONDS = 30.0
 
     def __init__(
@@ -76,6 +76,8 @@ class SkyLedgerTracker:
         self._stop_event = asyncio.Event()
         self._mutation_lock = asyncio.Lock()
         self._raw_position_tick = 0
+        self._last_wal_checkpoint_at = 0.0
+        self._wal_checkpoint_info: dict[str, int] | None = None
 
     async def run(self) -> None:
         self.tracker_running = True
@@ -130,6 +132,11 @@ class SkyLedgerTracker:
                 self.config.raw_position_retention_days,
             )
             self._raw_position_tick = 0
+        # Periodically checkpoint the WAL to prevent unbounded growth
+        now = time.monotonic()
+        if now - self._last_wal_checkpoint_at >= self.WAL_CHECKPOINT_INTERVAL_SECONDS:
+            self._wal_checkpoint_info = await asyncio.to_thread(self.db.checkpoint_wal)
+            self._last_wal_checkpoint_at = now
 
         await self._process_snapshots(fresh_snapshots)
         self._cleanup_active()
@@ -143,6 +150,8 @@ class SkyLedgerTracker:
         """Clear persistent and in-memory history without racing an ingestion tick."""
         async with self._mutation_lock:
             counts = await asyncio.to_thread(self.db.clear_history)
+            self._wal_checkpoint_info = None
+            self._last_wal_checkpoint_at = 0.0
             self.active.clear()
             self.alert_cooldowns.clear()
             payload = await self.build_payload_async()
@@ -367,6 +376,7 @@ class SkyLedgerTracker:
                 "tracker_last_error": self.tracker_last_error,
                 "tracker_consecutive_errors": self.tracker_consecutive_errors,
                 "database_path": self.db.path.name,
+                "wal_checkpoint_info": self._wal_checkpoint_info,
                 "config": self.config.public_dict(),
             }
         )

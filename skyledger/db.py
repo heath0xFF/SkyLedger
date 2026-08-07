@@ -595,10 +595,15 @@ class Database:
             self._summary_cache_at = 0.0
         return result
 
-    def checkpoint_wal(self) -> None:
-        """Checkpoint the WAL file to prevent unbounded growth and reduce lock contention."""
+    def checkpoint_wal(self) -> dict[str, int]:
+        """Checkpoint the WAL to prevent unbounded growth; return counters for monitoring."""
         with self.connect() as conn:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return {
+            "wal_pages": result[0] if result else 0,
+            "wal_frames_checkpointed": result[1] if result else 0,
+            "wal_frames_truncated": result[2] if result else 0,
+        }
 
     def quick_check(self) -> str:
         """Return SQLite's quick integrity-check result."""

@@ -15,10 +15,16 @@ def main() -> None:
     backup_parser = subparsers.add_parser("backup", help="Create a verified online backup")
     backup_parser.add_argument("destination", nargs="?", help="Output .db path")
     subparsers.add_parser("check", help="Run SQLite quick_check")
+    subparsers.add_parser("checkpoint", help="Checkpoint and truncate the WAL file")
     args = parser.parse_args()
 
     config = load_config(args.config)
     database = Database(config.database_path)
+
+    if args.command == "checkpoint":
+        info = database.checkpoint_wal()
+        print(f"WAL checkpoint: {info}")
+        return
 
     if args.command == "check":
         result = database.quick_check()
